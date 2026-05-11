@@ -9,7 +9,7 @@
         Title="MainWindow" Height="350" Width="525">
     <Grid>
         <TabControl>
-            <TabItem Header="Chart" IsSelected="{Binding IsChartTabSelected, Mode=OneWayToSource}">
+            <TabItem Header="Chart">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"></RowDefinition>
@@ -19,7 +19,7 @@
                         Inject/Stop Data
                     </Button>
                     <!--Here we disable tooltips and hovering to get a better performance-->
-                    <lvc:CartesianChart Grid.Row="1" Loaded="OnChartLoaded" AnimationsSpeed="0:0:0.15" Hoverable="False" DataTooltip="{x:Null}">
+                    <lvc:CartesianChart Grid.Row="1" IsVisibleChanged="OnChartIsVisibleChanged" AnimationsSpeed="0:0:0.15" Hoverable="False" DataTooltip="{x:Null}">
                         <lvc:CartesianChart.Series>
                             <lvc:LineSeries Values="{Binding ChartValues}" 
                                             PointGeometry="{x:Null}" 

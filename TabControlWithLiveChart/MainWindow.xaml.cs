@@ -16,6 +16,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using LiveCharts;
 using LiveCharts.Configurations;
 using TabControlWithLiveChart.Annotations;
@@ -81,7 +82,7 @@ namespace TabControlWithLiveChart
         private double _axisMin;
         private double _trend;
         private double _trend2;
-        private volatile bool _isChartTabSelected = true;
+        private volatile bool _isChartVisible = true;
         public ChartValues<MeasureModel> ChartValues { get; set; }
         public ChartValues<MeasureModel> ChartValues2 { get; set; }
         public Func<double, string> DateTimeFormatter { get; set; }
@@ -109,23 +110,6 @@ namespace TabControlWithLiveChart
 
         public bool IsReading { get; set; }
 
-        // Bound (OneWayToSource) to the chart TabItem's IsSelected so the
-        // background producer can pause while the chart is not in the visual
-        // tree. If we keep mutating ChartValues while the chart is unloaded,
-        // LiveCharts' ChartUpdater can latch IsUpdating=true on a render that
-        // never completes, and every subsequent CollectionChanged is then
-        // short-circuited by the `if (IsUpdating && !force) return;` guard.
-        public bool IsChartTabSelected
-        {
-            get { return _isChartTabSelected; }
-            set
-            {
-                if (_isChartTabSelected == value) return;
-                _isChartTabSelected = value;
-                OnPropertyChanged("IsChartTabSelected");
-            }
-        }
-
         private void Read()
         {
             var r = new Random();
@@ -135,11 +119,13 @@ namespace TabControlWithLiveChart
                 Debug.WriteLine($"hi");
                 Thread.Sleep(150);
 
-                // Don't push into ChartValues while the chart is off-screen.
-                // The chart is unloaded from the visual tree on tab change, and
-                // a render queued mid-flight will never complete, leaving the
-                // Updater stuck with IsUpdating=true forever.
-                if (!IsChartTabSelected) continue;
+                // Don't mutate ChartValues while the chart is off-screen.
+                // When the chart is invisible the DispatcherTimer still fires
+                // but UpdaterTick early-returns without calling Timer.Stop or
+                // resetting IsUpdating, latching the updater into a stuck
+                // IsUpdating=true state. Skipping Add here avoids feeding the
+                // bug in the first place.
+                if (!_isChartVisible) continue;
 
                 var now = DateTime.Now;
 
@@ -166,13 +152,27 @@ namespace TabControlWithLiveChart
             }
         }
 
-        private void OnChartLoaded(object sender, RoutedEventArgs e)
+        // Real root cause: in ChartUpdater.UpdaterTick the gate
+        //   if (!force && !wpfChart.IsVisible && !wpfChart.IsMocked) return;
+        // returns BEFORE Timer.Stop() and IsUpdating=false, so once a Tick
+        // fires while the chart is hidden the updater is permanently latched
+        // with IsUpdating=true. LiveCharts' own OnIsVisibleChanged calls
+        // Run() (force=false), which hits `if (IsUpdating) return;` and never
+        // recovers. We therefore have to kick the updater with force=true
+        // ourselves when the chart becomes visible again. BeginInvoke at
+        // Render priority makes the kick happen after WPF finishes the
+        // layout/render pass for the freshly-attached chart, by which time
+        // the Model and visual tree are ready.
+        private void OnChartIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
-            // Safety net for the case where a render was already in flight when
-            // the user switched tabs: force=true bypasses the IsUpdating guard
-            // in ChartUpdater.Run, unsticking the updater so live updates
-            // resume after the chart re-enters the visual tree.
-            ((LiveCharts.Wpf.CartesianChart)sender).Update(false, true);
+            var visible = (bool)e.NewValue;
+            _isChartVisible = visible;
+            if (!visible) return;
+
+            var chart = (LiveCharts.Wpf.CartesianChart)sender;
+            chart.Dispatcher.BeginInvoke(
+                new Action(() => chart.Update(false, true)),
+                DispatcherPriority.Render);
         }
 
         private void SetAxisLimits(DateTime now)
