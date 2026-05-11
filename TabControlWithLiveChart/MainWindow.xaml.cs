@@ -110,6 +110,35 @@ namespace TabControlWithLiveChart
 
         public bool IsReading { get; set; }
 
+        // The full root cause has two intertwined LiveCharts 0.9.7 bugs:
+        //
+        // (1) ChartValues<T> inherits NoisyCollection<T>, whose Add fires
+        //     CollectionChanged SYNCHRONOUSLY on the calling thread. That
+        //     event reaches ChartValues.OnChanged which calls
+        //     Trackers...Updater.Run() on the same thread. Run() does
+        //     `if (Timer == null) Timer = new DispatcherTimer{...};`. A
+        //     DispatcherTimer captures Dispatcher.CurrentDispatcher at
+        //     construction time. If the FIRST Run() after Chart.Unloaded
+        //     (which nulls the timer) happens on a ThreadPool thread, the
+        //     new DispatcherTimer is bound to that thread's dispatcher,
+        //     which has no message pump. Tick never fires there, so
+        //     IsUpdating stays true and the chart is dead forever — even
+        //     after the user comes back, because Run()'s `if (IsUpdating)
+        //     return;` guard short-circuits every future call.
+        //
+        // (2) Even with a UI-thread timer, ChartUpdater.UpdaterTick
+        //     early-returns BEFORE `Timer.Stop()` and `IsUpdating = false`
+        //     whenever the chart is invisible, latching IsUpdating=true.
+        //
+        // We have to fix both. We do it by:
+        //   - Marshaling all ChartValues mutations to the UI Dispatcher so
+        //     that any timer Run() ever creates is bound to the UI
+        //     Dispatcher with a real message pump.
+        //   - Pausing the producer while the chart is hidden so the (1)
+        //     race window during tab-switch doesn't trigger.
+        //   - Kicking the updater with force=true once the chart is
+        //     visible again, deferred to Render priority so the chart's
+        //     Model and visual state are ready.
         private void Read()
         {
             var r = new Random();
@@ -119,50 +148,33 @@ namespace TabControlWithLiveChart
                 Debug.WriteLine($"hi");
                 Thread.Sleep(150);
 
-                // Don't mutate ChartValues while the chart is off-screen.
-                // When the chart is invisible the DispatcherTimer still fires
-                // but UpdaterTick early-returns without calling Timer.Stop or
-                // resetting IsUpdating, latching the updater into a stuck
-                // IsUpdating=true state. Skipping Add here avoids feeding the
-                // bug in the first place.
                 if (!_isChartVisible) continue;
 
                 var now = DateTime.Now;
-
                 _trend += r.Next(-8, 10);
                 _trend2 += r.Next(-8, 10);
+                var trend = _trend;
+                var trend2 = _trend2;
 
-                ChartValues.Add(new MeasureModel
+                // BeginInvoke marshals onto the UI Dispatcher. Critically,
+                // any DispatcherTimer LiveCharts creates from inside the
+                // resulting Updater.Run() will then capture the UI
+                // Dispatcher and its Tick will actually fire.
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    DateTime = now,
-                    Value = _trend
-                });
+                    if (!_isChartVisible) return;
 
-                ChartValues2.Add(new MeasureModel
-                {
-                    DateTime = now,
-                    Value = _trend2
-                });
+                    ChartValues.Add(new MeasureModel { DateTime = now, Value = trend });
+                    ChartValues2.Add(new MeasureModel { DateTime = now, Value = trend2 });
 
-                SetAxisLimits(now);
+                    SetAxisLimits(now);
 
-                //lets only use the last 150 values
-                if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
-                if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
+                    if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
+                    if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
+                }));
             }
         }
 
-        // Real root cause: in ChartUpdater.UpdaterTick the gate
-        //   if (!force && !wpfChart.IsVisible && !wpfChart.IsMocked) return;
-        // returns BEFORE Timer.Stop() and IsUpdating=false, so once a Tick
-        // fires while the chart is hidden the updater is permanently latched
-        // with IsUpdating=true. LiveCharts' own OnIsVisibleChanged calls
-        // Run() (force=false), which hits `if (IsUpdating) return;` and never
-        // recovers. We therefore have to kick the updater with force=true
-        // ourselves when the chart becomes visible again. BeginInvoke at
-        // Render priority makes the kick happen after WPF finishes the
-        // layout/render pass for the freshly-attached chart, by which time
-        // the Model and visual tree are ready.
         private void OnChartIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
             var visible = (bool)e.NewValue;
