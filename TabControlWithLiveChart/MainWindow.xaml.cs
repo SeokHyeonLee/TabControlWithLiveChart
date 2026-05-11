@@ -81,6 +81,7 @@ namespace TabControlWithLiveChart
         private double _axisMin;
         private double _trend;
         private double _trend2;
+        private volatile bool _isChartTabSelected = true;
         public ChartValues<MeasureModel> ChartValues { get; set; }
         public ChartValues<MeasureModel> ChartValues2 { get; set; }
         public Func<double, string> DateTimeFormatter { get; set; }
@@ -108,6 +109,23 @@ namespace TabControlWithLiveChart
 
         public bool IsReading { get; set; }
 
+        // Bound (OneWayToSource) to the chart TabItem's IsSelected so the
+        // background producer can pause while the chart is not in the visual
+        // tree. If we keep mutating ChartValues while the chart is unloaded,
+        // LiveCharts' ChartUpdater can latch IsUpdating=true on a render that
+        // never completes, and every subsequent CollectionChanged is then
+        // short-circuited by the `if (IsUpdating && !force) return;` guard.
+        public bool IsChartTabSelected
+        {
+            get { return _isChartTabSelected; }
+            set
+            {
+                if (_isChartTabSelected == value) return;
+                _isChartTabSelected = value;
+                OnPropertyChanged("IsChartTabSelected");
+            }
+        }
+
         private void Read()
         {
             var r = new Random();
@@ -116,6 +134,13 @@ namespace TabControlWithLiveChart
             {
                 Debug.WriteLine($"hi");
                 Thread.Sleep(150);
+
+                // Don't push into ChartValues while the chart is off-screen.
+                // The chart is unloaded from the visual tree on tab change, and
+                // a render queued mid-flight will never complete, leaving the
+                // Updater stuck with IsUpdating=true forever.
+                if (!IsChartTabSelected) continue;
+
                 var now = DateTime.Now;
 
                 _trend += r.Next(-8, 10);
@@ -139,6 +164,15 @@ namespace TabControlWithLiveChart
                 if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
                 if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
             }
+        }
+
+        private void OnChartLoaded(object sender, RoutedEventArgs e)
+        {
+            // Safety net for the case where a render was already in flight when
+            // the user switched tabs: force=true bypasses the IsUpdating guard
+            // in ChartUpdater.Run, unsticking the updater so live updates
+            // resume after the chart re-enters the visual tree.
+            ((LiveCharts.Wpf.CartesianChart)sender).Update(false, true);
         }
 
         private void SetAxisLimits(DateTime now)
