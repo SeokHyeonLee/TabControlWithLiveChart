@@ -110,35 +110,52 @@ namespace TabControlWithLiveChart
 
         public bool IsReading { get; set; }
 
-        // The full root cause has two intertwined LiveCharts 0.9.7 bugs:
+        // LiveCharts 0.9.7 has three intertwined defects that combine to
+        // produce the "freeze / 2 Hz after tab switch" behavior. All three
+        // must be addressed; fixing only one or two still feels broken.
         //
-        // (1) ChartValues<T> inherits NoisyCollection<T>, whose Add fires
-        //     CollectionChanged SYNCHRONOUSLY on the calling thread. That
-        //     event reaches ChartValues.OnChanged which calls
-        //     Trackers...Updater.Run() on the same thread. Run() does
-        //     `if (Timer == null) Timer = new DispatcherTimer{...};`. A
-        //     DispatcherTimer captures Dispatcher.CurrentDispatcher at
-        //     construction time. If the FIRST Run() after Chart.Unloaded
-        //     (which nulls the timer) happens on a ThreadPool thread, the
-        //     new DispatcherTimer is bound to that thread's dispatcher,
-        //     which has no message pump. Tick never fires there, so
-        //     IsUpdating stays true and the chart is dead forever — even
-        //     after the user comes back, because Run()'s `if (IsUpdating)
-        //     return;` guard short-circuits every future call.
+        // (A) Phantom-dispatcher Timer.
+        //     NoisyCollection<T>.Add (the base of ChartValues<T>) raises
+        //     CollectionChanged synchronously on the caller's thread.
+        //     ChartValues.OnChanged then calls Updater.Run() on that same
+        //     thread. Run() lazily creates `new DispatcherTimer { ... }`,
+        //     which captures Dispatcher.CurrentDispatcher at construction.
+        //     Chart.Unloaded sets the Timer to null on tab change, so if the
+        //     next ChartValues.Add comes from the ThreadPool thread that
+        //     Task.Factory.StartNew gave us, the new Timer is bound to that
+        //     thread's dispatcher — which has no message pump. Tick never
+        //     fires, IsUpdating stays true, and Run()'s
+        //     `if (IsUpdating) return;` guard short-circuits every later
+        //     call forever.
         //
-        // (2) Even with a UI-thread timer, ChartUpdater.UpdaterTick
-        //     early-returns BEFORE `Timer.Stop()` and `IsUpdating = false`
-        //     whenever the chart is invisible, latching IsUpdating=true.
+        // (B) Latched IsUpdating.
+        //     ChartUpdater.UpdaterTick early-returns BEFORE Timer.Stop() /
+        //     IsUpdating=false when the chart is invisible, so a Tick that
+        //     fires while the chart is off-screen also leaves IsUpdating
+        //     latched true.
         //
-        // We have to fix both. We do it by:
-        //   - Marshaling all ChartValues mutations to the UI Dispatcher so
-        //     that any timer Run() ever creates is bound to the UI
-        //     Dispatcher with a real message pump.
-        //   - Pausing the producer while the chart is hidden so the (1)
-        //     race window during tab-switch doesn't trigger.
-        //   - Kicking the updater with force=true once the chart is
-        //     visible again, deferred to Render priority so the chart's
-        //     Model and visual state are ready.
+        // (C) DispatcherPriority inversion.
+        //     LiveCharts' internal DispatcherTimer uses default priority
+        //     `Background` (4) for Tick delivery. Dispatcher.BeginInvoke
+        //     used by a naive UI-thread marshal defaults to `Normal` (9).
+        //     With Background-rate Adds beating Background-rate Ticks in
+        //     the queue, the Add's Run() short-circuits on IsUpdating=true
+        //     while the Tick keeps waiting, so the effective render cadence
+        //     drops from 1× Sleep interval to 2× — chart visibly stutters
+        //     even when it isn't fully stuck.
+        //
+        // Fix:
+        //   * Marshal every ChartValues mutation to the UI Dispatcher so no
+        //     Timer can ever be born on a ThreadPool dispatcher — kills (A).
+        //   * Pause the producer while the chart is hidden so no Tick ever
+        //     fires invisible — kills (B).
+        //   * After mutating the collections, call chart.Update(false,true)
+        //     synchronously. Run(_, updateNow=true) routes through
+        //     UpdaterTick directly with force=true, which calls Timer.Stop
+        //     and resets IsUpdating itself, so the internal DispatcherTimer
+        //     is bypassed end-to-end — kills (C).
+        //   * On the tab coming back, kick once with restartView=true to
+        //     rebuild any stale visual state left by Unloaded.
         private void Read()
         {
             var r = new Random();
@@ -156,10 +173,6 @@ namespace TabControlWithLiveChart
                 var trend = _trend;
                 var trend2 = _trend2;
 
-                // BeginInvoke marshals onto the UI Dispatcher. Critically,
-                // any DispatcherTimer LiveCharts creates from inside the
-                // resulting Updater.Run() will then capture the UI
-                // Dispatcher and its Tick will actually fire.
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
                     if (!_isChartVisible) return;
@@ -171,6 +184,15 @@ namespace TabControlWithLiveChart
 
                     if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
                     if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
+
+                    // Force the render right now, bypassing the
+                    // Background-priority DispatcherTimer that otherwise
+                    // halves the frame rate against our Normal-priority
+                    // Adds. Run(_, updateNow=true) goes through
+                    // UpdaterTick directly with force=true, which stops
+                    // any pending Tick and clears IsUpdating, so the
+                    // updater state stays clean across every cycle.
+                    Chart.Update(false, true);
                 }));
             }
         }
@@ -182,8 +204,12 @@ namespace TabControlWithLiveChart
             if (!visible) return;
 
             var chart = (LiveCharts.Wpf.CartesianChart)sender;
+            // restartView=true rebuilds the series visual elements that
+            // Chart.Unloaded left in a stale state. Deferred to Render
+            // priority so it happens after WPF lays out the freshly
+            // re-attached chart and its ActualWidth/Height are valid.
             chart.Dispatcher.BeginInvoke(
-                new Action(() => chart.Update(false, true)),
+                new Action(() => chart.Update(true, true)),
                 DispatcherPriority.Render);
         }
 

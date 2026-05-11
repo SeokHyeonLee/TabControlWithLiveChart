@@ -19,7 +19,7 @@
                         Inject/Stop Data
                     </Button>
                     <!--Here we disable tooltips and hovering to get a better performance-->
-                    <lvc:CartesianChart Grid.Row="1" IsVisibleChanged="OnChartIsVisibleChanged" AnimationsSpeed="0:0:0.15" Hoverable="False" DataTooltip="{x:Null}">
+                    <lvc:CartesianChart x:Name="Chart" Grid.Row="1" IsVisibleChanged="OnChartIsVisibleChanged" AnimationsSpeed="0:0:0.15" Hoverable="False" DataTooltip="{x:Null}">
                         <lvc:CartesianChart.Series>
                             <lvc:LineSeries Values="{Binding ChartValues}" 
                                             PointGeometry="{x:Null}" 
