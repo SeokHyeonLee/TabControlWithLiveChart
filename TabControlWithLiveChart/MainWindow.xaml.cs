@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -75,6 +76,57 @@ namespace TabControlWithLiveChart
             IsReading = false;
 
             DataContext = this;
+
+            // See docs/LiveCharts-TabSwitchFix.md for the full root-cause
+            // analysis. In one line: LiveCharts.Wpf.Components.ChartUpdater
+            // captures the base Chart's default AnimationsSpeed (300 ms)
+            // into a private `Freq` field that is never re-synced when
+            // DisableAnimations / AnimationsSpeed change. After every tab
+            // Unloaded → Run() recreates the Timer at that stale 300 ms,
+            // and pan/zoom rendering collapses to ~3 Hz. We rewrite the
+            // field directly via reflection so subsequent Timer
+            // recreations use the actual current frequency.
+            SyncUpdaterFreq();
+        }
+
+        private static readonly PropertyInfo UpdaterFreqProperty =
+            typeof(LiveCharts.Wpf.CartesianChart).Assembly
+                .GetType("LiveCharts.Wpf.Components.ChartUpdater")
+                ?.GetProperty("Freq", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private void SyncUpdaterFreq()
+        {
+            var updater = Chart.Model?.Updater;
+            if (updater == null || UpdaterFreqProperty == null) return;
+
+            var freq = Chart.DisableAnimations
+                ? TimeSpan.FromMilliseconds(10)
+                : Chart.AnimationsSpeed;
+            UpdaterFreqProperty.SetValue(updater, freq);
+        }
+
+        // Tracks whether the chart is currently in the visual tree. Set
+        // from IsVisibleChanged on the UI thread, read from the
+        // background producer to avoid two further LiveCharts defects:
+        //
+        //   * ChartValues.Add fires CollectionChanged on the calling
+        //     thread; calling it from the ThreadPool while Timer is null
+        //     makes Run() build a DispatcherTimer bound to the
+        //     ThreadPool thread's pump-less dispatcher (phantom timer →
+        //     IsUpdating latched true forever).
+        //
+        //   * UpdaterTick early-returns when invisible WITHOUT calling
+        //     Timer.Stop or IsUpdating=false, so any tick that fires
+        //     while the chart is off-screen also latches IsUpdating.
+        //
+        // Pausing the producer while invisible avoids both: no Run() is
+        // ever triggered on a background thread and no Tick ever fires
+        // off-screen.
+        private volatile bool _isChartVisible = true;
+
+        private void OnChartIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            _isChartVisible = (bool)e.NewValue;
         }
 
         private double _axisMax;
@@ -116,28 +168,27 @@ namespace TabControlWithLiveChart
             {
                 Debug.WriteLine($"hi");
                 Thread.Sleep(150);
-                var now = DateTime.Now;
 
+                if (!_isChartVisible) continue;
+
+                var now = DateTime.Now;
                 _trend += r.Next(-8, 10);
                 _trend2 += r.Next(-8, 10);
+                var trend = _trend;
+                var trend2 = _trend2;
 
-                ChartValues.Add(new MeasureModel
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    DateTime = now,
-                    Value = _trend
-                });
+                    if (!_isChartVisible) return;
 
-                ChartValues2.Add(new MeasureModel
-                {
-                    DateTime = now,
-                    Value = _trend2
-                });
+                    ChartValues.Add(new MeasureModel { DateTime = now, Value = trend });
+                    ChartValues2.Add(new MeasureModel { DateTime = now, Value = trend2 });
 
-                SetAxisLimits(now);
+                    SetAxisLimits(now);
 
-                //lets only use the last 150 values
-                if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
-                if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
+                    if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
+                    if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
+                }));
             }
         }
 
