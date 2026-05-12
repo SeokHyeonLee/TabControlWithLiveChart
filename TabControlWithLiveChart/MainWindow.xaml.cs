@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -19,6 +20,7 @@ using System.Windows.Shapes;
 using System.Windows.Threading;
 using LiveCharts;
 using LiveCharts.Configurations;
+using LiveCharts.Events;
 using TabControlWithLiveChart.Annotations;
 
 namespace TabControlWithLiveChart
@@ -76,6 +78,57 @@ namespace TabControlWithLiveChart
             IsReading = false;
 
             DataContext = this;
+
+            // Sync the Updater's stale `Freq` field to the actual desired
+            // frequency. The base Chart constructor does
+            //   SetCurrentValue(AnimationsSpeedProperty, 300ms);
+            // BEFORE the CartesianChart constructor runs, and
+            // CartesianChart() then captures that 300ms into the
+            // ChartUpdater via `new ChartUpdater(freq)` — which stores it
+            // in a private `Freq` field. Our XAML attributes
+            // (DisableAnimations=True / AnimationsSpeed=150ms) only
+            // trigger UpdateChartFrequency, which calls
+            // UpdaterImpl.UpdateFrequency() that just assigns
+            // Timer.Interval. `Freq` is never re-synced.
+            //
+            // The chart's Unloaded handler nulls the Timer on tab change,
+            // and the next Run() recreates it as
+            //   Timer = new DispatcherTimer { Interval = Freq };
+            // — i.e. Interval = 300ms. After a tab switch every
+            // Timer-driven render (pan/zoom included) ticks at 3.3 Hz
+            // instead of 100 Hz. That is the pan lag.
+            SyncUpdaterFreqToCurrentAnimationSettings();
+
+            // Belt-and-suspenders: any user pan/zoom calls SetRange,
+            // which kicks Updater.Run() through the stale Timer. The
+            // Axis fires RangeChanged synchronously right after
+            // MaxValue/MinValue are set — we hook it and force a
+            // synchronous render that bypasses the Timer entirely.
+            foreach (var ax in Chart.AxisX)
+                ax.RangeChanged += OnAxisRangeChanged;
+            foreach (var ax in Chart.AxisY)
+                ax.RangeChanged += OnAxisRangeChanged;
+        }
+
+        private static readonly PropertyInfo UpdaterFreqProperty =
+            typeof(LiveCharts.Wpf.CartesianChart).Assembly
+                .GetType("LiveCharts.Wpf.Components.ChartUpdater")
+                ?.GetProperty("Freq", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private void SyncUpdaterFreqToCurrentAnimationSettings()
+        {
+            var updater = Chart.Model?.Updater;
+            if (updater == null || UpdaterFreqProperty == null) return;
+
+            var freq = Chart.DisableAnimations
+                ? TimeSpan.FromMilliseconds(10)
+                : Chart.AnimationsSpeed;
+            UpdaterFreqProperty.SetValue(updater, freq);
+        }
+
+        private void OnAxisRangeChanged(RangeChangedEventArgs eventArgs)
+        {
+            Chart.Update(false, true);
         }
 
         private double _axisMax;
