@@ -17,8 +17,11 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using LiveCharts;
 using LiveCharts.Configurations;
+using LiveCharts.Events;
+using LiveCharts.Wpf;
 using TabControlWithLiveChart.Annotations;
 
 namespace TabControlWithLiveChart
@@ -96,6 +99,39 @@ namespace TabControlWithLiveChart
 
             _chartVisibility[Chart] = true;     // first tab is selected by default
             _chartVisibility[Chart2] = false;
+
+            // Pre-populate 100 data points so the pan-limit feature
+            // has something to scroll over. Both LineSeries share the
+            // collections, so Chart and Chart2 show the same data.
+            {
+                var rng = new Random(42);
+                var origin = DateTime.Now;
+                double t1 = 0, t2 = 0;
+                for (var i = 0; i < 100; i++)
+                {
+                    t1 += rng.Next(-8, 10);
+                    t2 += rng.Next(-8, 10);
+                    var when = origin.AddSeconds(i);
+                    ChartValues.Add(new MeasureModel { DateTime = when, Value = t1 });
+                    ChartValues2.Add(new MeasureModel { DateTime = when, Value = t2 });
+                }
+                _trend = t1;
+                _trend2 = t2;
+            }
+
+            // Initial view: first 12 of 100 points. The chart's axis
+            // MinValue/MaxValue are now driven directly by user pan
+            // (and by our clamping logic), no longer by the AxisMin/
+            // AxisMax VM properties.
+            var first12Min = ChartValues[0].DateTime.Ticks;
+            var first12Max = ChartValues[11].DateTime.Ticks;
+            Chart.AxisX[0].MinValue = first12Min;
+            Chart.AxisX[0].MaxValue = first12Max;
+            Chart2.AxisX[0].MinValue = first12Min;
+            Chart2.AxisX[0].MaxValue = first12Max;
+
+            InstallPanLimits(Chart, ChartLeftShadow, ChartRightShadow);
+            InstallPanLimits(Chart2, Chart2LeftShadow, Chart2RightShadow);
         }
 
         private static readonly Type ChartBaseType =
@@ -170,6 +206,115 @@ namespace TabControlWithLiveChart
                 ChartIsPanningProperty?.SetValue(chart, false);
             };
         }
+
+        // === Pan limits + side shadows =====================================
+
+        private void InstallPanLimits(CartesianChart chart, Rectangle leftShadow, Rectangle rightShadow)
+        {
+            var axis = chart.AxisX[0];
+
+            // Clamp pan so the axis never moves outside the data
+            // range. Axis.SetRange (the path Pan/Zoom both take)
+            // raises PreviewRangeChanged synchronously BEFORE
+            // assigning MaxValue/MinValue, and respects pe.Cancel —
+            // so we cancel out-of-range proposals and re-apply a
+            // clamped range via the MinValue/MaxValue setters, which
+            // only fire UpdateChart (no PreviewRangeChanged), giving
+            // us a one-shot clamp without recursion.
+            axis.PreviewRangeChanged += pe => ClampPan(pe, axis);
+
+            // Shadows need to be repositioned whenever the chart's
+            // layout box changes, and re-evaluated for visibility
+            // whenever the visible window slides over the data.
+            Action update = () => UpdateShadow(chart, axis, leftShadow, rightShadow);
+            axis.RangeChanged += e => update();
+            chart.SizeChanged += (s, e) => update();
+            chart.Loaded += (s, e) =>
+                chart.Dispatcher.BeginInvoke(update, DispatcherPriority.Loaded);
+        }
+
+        private static void ClampPan(PreviewRangeChangedEventArgs pe, Axis axis)
+        {
+            var min = pe.PreviewMinValue;
+            var max = pe.PreviewMaxValue;
+            var width = max - min;
+            var dataMin = axis.Model.BotLimit;
+            var dataMax = axis.Model.TopLimit;
+
+            var newMin = min;
+            var newMax = max;
+
+            if (newMin < dataMin)
+            {
+                newMin = dataMin;
+                newMax = Math.Min(newMin + width, dataMax);
+            }
+            else if (newMax > dataMax)
+            {
+                newMax = dataMax;
+                newMin = Math.Max(newMax - width, dataMin);
+            }
+
+            if (newMin == min && newMax == max) return;
+
+            pe.Cancel = true;
+            axis.MinValue = newMin;
+            axis.MaxValue = newMax;
+        }
+
+        private static void UpdateShadow(CartesianChart chart, Axis axis,
+            Rectangle leftShadow, Rectangle rightShadow)
+        {
+            var drawMargin = ChartDrawMarginProperty?.GetValue(chart) as Canvas;
+            if (drawMargin == null || !drawMargin.IsVisible
+                || chart.ActualWidth == 0 || drawMargin.ActualWidth == 0)
+            {
+                leftShadow.Visibility = Visibility.Collapsed;
+                rightShadow.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            Point plotTopLeft;
+            try
+            {
+                plotTopLeft = drawMargin.TransformToAncestor(chart).Transform(new Point(0, 0));
+            }
+            catch
+            {
+                return;
+            }
+
+            var plotLeft = plotTopLeft.X;
+            var plotTop = plotTopLeft.Y;
+            var plotWidth = drawMargin.ActualWidth;
+
+            // Vertical span: from the top of the plot area down to the
+            // bottom of the chart, so the shadow covers the X axis
+            // label strip too (as requested).
+            var shadowHeight = chart.ActualHeight - plotTop;
+            if (shadowHeight <= 0) return;
+
+            Canvas.SetLeft(leftShadow, plotLeft);
+            Canvas.SetTop(leftShadow, plotTop);
+            leftShadow.Height = shadowHeight;
+
+            Canvas.SetLeft(rightShadow, plotLeft + plotWidth - rightShadow.Width);
+            Canvas.SetTop(rightShadow, plotTop);
+            rightShadow.Height = shadowHeight;
+
+            var dataMin = axis.Model.BotLimit;
+            var dataMax = axis.Model.TopLimit;
+            var min = double.IsNaN(axis.MinValue) ? dataMin : axis.MinValue;
+            var max = double.IsNaN(axis.MaxValue) ? dataMax : axis.MaxValue;
+
+            // Tiny epsilon so floating-point inaccuracy doesn't leave a
+            // permanent shadow glued to the edge after a clamped pan.
+            const double eps = 1e-3;
+            leftShadow.Visibility = min > dataMin + eps ? Visibility.Visible : Visibility.Collapsed;
+            rightShadow.Visibility = max < dataMax - eps ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        // === Visibility tracking ==========================================
 
         // Per-chart visibility tracked from each chart's
         // IsVisibleChanged. The background producer pauses only when
