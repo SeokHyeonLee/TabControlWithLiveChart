@@ -148,6 +148,28 @@ namespace TabControlWithLiveChart
         private static readonly PropertyInfo ChartIsPanningProperty =
             ChartBaseType?.GetProperty("IsPanning", BindingFlags.NonPublic | BindingFlags.Instance);
 
+        // AxisCore.BotLimit / TopLimit are `internal` in LiveCharts
+        // 0.9.7, so we can't reach them with a normal member access
+        // from this assembly — same situation as Freq / IsPanning /
+        // DrawMargin. Grab them once via reflection.
+        private static readonly PropertyInfo AxisCoreBotLimitProperty =
+            typeof(LiveCharts.AxisCore)
+                .GetProperty("BotLimit", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private static readonly PropertyInfo AxisCoreTopLimitProperty =
+            typeof(LiveCharts.AxisCore)
+                .GetProperty("TopLimit", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private static double GetBotLimit(LiveCharts.AxisCore model)
+        {
+            return (double)AxisCoreBotLimitProperty.GetValue(model);
+        }
+
+        private static double GetTopLimit(LiveCharts.AxisCore model)
+        {
+            return (double)AxisCoreTopLimitProperty.GetValue(model);
+        }
+
         private static void ApplyLiveChartsTabSwitchFix(LiveCharts.Wpf.CartesianChart chart)
         {
             SyncUpdaterFreq(chart);
@@ -238,8 +260,8 @@ namespace TabControlWithLiveChart
             var min = pe.PreviewMinValue;
             var max = pe.PreviewMaxValue;
             var width = max - min;
-            var dataMin = axis.Model.BotLimit;
-            var dataMax = axis.Model.TopLimit;
+            var dataMin = GetBotLimit(axis.Model);
+            var dataMax = GetTopLimit(axis.Model);
 
             var newMin = min;
             var newMax = max;
@@ -302,8 +324,8 @@ namespace TabControlWithLiveChart
             Canvas.SetTop(rightShadow, plotTop);
             rightShadow.Height = shadowHeight;
 
-            var dataMin = axis.Model.BotLimit;
-            var dataMax = axis.Model.TopLimit;
+            var dataMin = GetBotLimit(axis.Model);
+            var dataMax = GetTopLimit(axis.Model);
             var min = double.IsNaN(axis.MinValue) ? dataMin : axis.MinValue;
             var max = double.IsNaN(axis.MaxValue) ? dataMax : axis.MaxValue;
 
