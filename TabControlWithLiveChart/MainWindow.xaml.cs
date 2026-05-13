@@ -17,6 +17,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using LiveCharts;
 using LiveCharts.Configurations;
 using TabControlWithLiveChart.Annotations;
@@ -50,7 +51,7 @@ namespace TabControlWithLiveChart
             //http://lvcharts.net/App/examples/v1/wpf/Types%20and%20Configuration
 
             var mapper = Mappers.Xy<MeasureModel>()
-                .X(model => model.DateTime.Ticks)   //use DateTime.Ticks as X
+                .X((model, i) => i)                 //use the data point's index as X
                 .Y(model => model.Value);           //use the value property as Y
 
             //lets save the mapper globally.
@@ -60,18 +61,8 @@ namespace TabControlWithLiveChart
             ChartValues = new ChartValues<MeasureModel>();
             ChartValues2 = new ChartValues<MeasureModel>();
 
-            //lets set how to display the X Labels
-            DateTimeFormatter = value => new DateTime((long)value).ToString("mm:ss");
-
-            //AxisStep forces the distance between each separator in the X axis
-            AxisStep = TimeSpan.FromSeconds(1).Ticks;
-            //AxisUnit forces lets the axis know that we are plotting seconds
-            //this is not always necessary, but it can prevent wrong labeling
-            AxisUnit = TimeSpan.TicksPerSecond;
-
-            SetAxisLimits(DateTime.Now);
-
-            //The next code simulates data changes every 300 ms
+            //X labels just show the data point index now that X is index-based.
+            IndexFormatter = value => ((int)Math.Round(value)).ToString();
 
             IsReading = false;
 
@@ -98,6 +89,159 @@ namespace TabControlWithLiveChart
             // mouse around the existing Down/Up handlers so MouseUp
             // always reaches DrawMargin even when the cursor is outside.
             HookMouseCaptureForPan();
+
+            // Pre-populate 100 fixed data points so we have something to
+            // scroll over. Both LineSeries share the same X (index), so
+            // they overlay on the same axis.
+            {
+                var rng = new Random(42);
+                double t1 = 0, t2 = 0;
+                var origin = DateTime.Now;
+                for (var i = 0; i < 100; i++)
+                {
+                    t1 += rng.Next(-8, 10);
+                    t2 += rng.Next(-8, 10);
+                    var when = origin.AddSeconds(i);
+                    ChartValues.Add(new MeasureModel { DateTime = when, Value = t1 });
+                    ChartValues2.Add(new MeasureModel { DateTime = when, Value = t2 });
+                }
+                _trend = t1;
+                _trend2 = t2;
+            }
+
+            // Initial window onto the data and the pan-limit / shadow
+            // wiring need the AxisX[0].Model + DrawMargin to be live,
+            // which only happens after the chart is loaded. Defer the
+            // setup to Loaded.
+            Chart.Loaded += OnChartLoadedSetupPanLimits;
+        }
+
+        // 12 of N visible at a time. The DATA range is [0, ChartValues.Count - 1].
+        private double DataMin { get { return 0; } }
+        private double DataMax { get { return Math.Max(0, ChartValues.Count - 1); } }
+        private const double InitialMinValue = 0;
+        private const double InitialMaxValue = 11;
+
+        private bool _panLimitsInstalled;
+
+        private void OnChartLoadedSetupPanLimits(object sender, RoutedEventArgs e)
+        {
+            if (_panLimitsInstalled) return;
+            _panLimitsInstalled = true;
+
+            // Set the initial 12-point view on the live chart axis.
+            // (Removed the AxisMin/AxisMax binding in XAML, so this
+            // assignment is the single source of truth for the axis.)
+            Chart.AxisX[0].MinValue = InitialMinValue;
+            Chart.AxisX[0].MaxValue = InitialMaxValue;
+
+            HookPanLimits(Chart, ChartLeftShadow, ChartRightShadow);
+        }
+
+        // === Pan limits via PreviewMouseMove ==============================
+
+        private void HookPanLimits(LiveCharts.Wpf.CartesianChart chart,
+            System.Windows.Shapes.Rectangle leftShadow,
+            System.Windows.Shapes.Rectangle rightShadow)
+        {
+            var drawMargin = ChartDrawMarginProperty?.GetValue(chart) as Canvas;
+            if (drawMargin == null) return;
+
+            // PreviewMouseMove tunnels down — at DrawMargin (where
+            // LiveCharts has its PanOnMouseMove bubble handler) we get
+            // a chance to mark the event as Handled BEFORE the pan
+            // handler runs. With Handled=true, the bubble subscriber
+            // is skipped, so the proposed pan never reaches SetRange.
+            //
+            // The rule (mirroring the hint): take the mouse's data
+            // X under the current axis. If it strays more than 0.5
+            // units outside [MinValue, MaxValue], treat it as
+            // "trying to scroll past where the chart actually has
+            // anything to show" and cancel.
+            drawMargin.PreviewMouseMove += (s, e) =>
+            {
+                var axis = chart.AxisX[0];
+                if (drawMargin.ActualWidth <= 0) return;
+                if (double.IsNaN(axis.MinValue) || double.IsNaN(axis.MaxValue)) return;
+
+                var pos = e.GetPosition(drawMargin);
+                var range = axis.MaxValue - axis.MinValue;
+                if (range <= 0) return;
+
+                var cursorData = axis.MinValue + (pos.X / drawMargin.ActualWidth) * range;
+
+                if (cursorData < axis.MinValue - 0.5 || cursorData > axis.MaxValue + 0.5)
+                {
+                    e.Handled = true;
+                }
+            };
+
+            // Shadows need to be repositioned when the chart's layout
+            // box changes, and re-evaluated whenever the visible
+            // window slides over the data.
+            Action update = () => UpdateShadow(chart, leftShadow, rightShadow);
+            chart.AxisX[0].RangeChanged += _ => update();
+            chart.SizeChanged += (s, e) => update();
+            drawMargin.SizeChanged += (s, e) => update();
+
+            // Initial paint of the shadows. We've just set MinValue /
+            // MaxValue above, which queued a render. ContextIdle (3)
+            // fires after LiveCharts' Background-priority (4) Tick has
+            // sized DrawMargin, so by the time this runs there's a
+            // real plot area to anchor the shadow rectangles to.
+            chart.Dispatcher.BeginInvoke(update, DispatcherPriority.ContextIdle);
+        }
+
+        private void UpdateShadow(LiveCharts.Wpf.CartesianChart chart,
+            System.Windows.Shapes.Rectangle leftShadow,
+            System.Windows.Shapes.Rectangle rightShadow)
+        {
+            var drawMargin = ChartDrawMarginProperty?.GetValue(chart) as Canvas;
+            if (drawMargin == null || !drawMargin.IsVisible
+                || chart.ActualWidth <= 0 || drawMargin.ActualWidth <= 0)
+            {
+                leftShadow.Visibility = Visibility.Collapsed;
+                rightShadow.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            Point plotTopLeft;
+            try
+            {
+                plotTopLeft = drawMargin.TransformToAncestor(chart).Transform(new Point(0, 0));
+            }
+            catch
+            {
+                return;
+            }
+
+            var plotLeft = plotTopLeft.X;
+            var plotTop = plotTopLeft.Y;
+            var plotWidth = drawMargin.ActualWidth;
+
+            // Vertical span: from the top of the plot area down to the
+            // bottom of the chart so the rectangle also covers the X
+            // axis label strip below DrawMargin.
+            var shadowHeight = chart.ActualHeight - plotTop;
+            if (shadowHeight <= 0) return;
+
+            Canvas.SetLeft(leftShadow, plotLeft);
+            Canvas.SetTop(leftShadow, plotTop);
+            leftShadow.Height = shadowHeight;
+
+            Canvas.SetLeft(rightShadow, plotLeft + plotWidth - rightShadow.Width);
+            Canvas.SetTop(rightShadow, plotTop);
+            rightShadow.Height = shadowHeight;
+
+            // Visibility tracks "is there still data to scroll into on
+            // this side?". Tiny epsilon so a clamped pan resting on
+            // the boundary doesn't leave a permanent shadow.
+            var axis = chart.AxisX[0];
+            var min = double.IsNaN(axis.MinValue) ? DataMin : axis.MinValue;
+            var max = double.IsNaN(axis.MaxValue) ? DataMax : axis.MaxValue;
+            const double eps = 1e-3;
+            leftShadow.Visibility = min > DataMin + eps ? Visibility.Visible : Visibility.Collapsed;
+            rightShadow.Visibility = max < DataMax - eps ? Visibility.Visible : Visibility.Collapsed;
         }
 
         private static readonly Type ChartBaseType =
@@ -193,34 +337,11 @@ namespace TabControlWithLiveChart
             _isChartVisible = (bool)e.NewValue;
         }
 
-        private double _axisMax;
-        private double _axisMin;
         private double _trend;
         private double _trend2;
         public ChartValues<MeasureModel> ChartValues { get; set; }
         public ChartValues<MeasureModel> ChartValues2 { get; set; }
-        public Func<double, string> DateTimeFormatter { get; set; }
-        public double AxisStep { get; set; }
-        public double AxisUnit { get; set; }
-
-        public double AxisMax
-        {
-            get { return _axisMax; }
-            set
-            {
-                _axisMax = value;
-                OnPropertyChanged("AxisMax");
-            }
-        }
-        public double AxisMin
-        {
-            get { return _axisMin; }
-            set
-            {
-                _axisMin = value;
-                OnPropertyChanged("AxisMin");
-            }
-        }
+        public Func<double, string> IndexFormatter { get; set; }
 
         public bool IsReading { get; set; }
 
@@ -248,18 +369,10 @@ namespace TabControlWithLiveChart
                     ChartValues.Add(new MeasureModel { DateTime = now, Value = trend });
                     ChartValues2.Add(new MeasureModel { DateTime = now, Value = trend2 });
 
-                    SetAxisLimits(now);
-
                     if (ChartValues.Count > 150) ChartValues.RemoveAt(0);
                     if (ChartValues2.Count > 150) ChartValues2.RemoveAt(0);
                 }));
             }
-        }
-
-        private void SetAxisLimits(DateTime now)
-        {
-            AxisMax = now.Ticks + TimeSpan.FromSeconds(1).Ticks; // lets force the axis to be 1 second ahead
-            AxisMin = now.Ticks - TimeSpan.FromSeconds(10).Ticks; // and 8 seconds behind
         }
 
         private void InjectStopOnClick(object sender, RoutedEventArgs e)
