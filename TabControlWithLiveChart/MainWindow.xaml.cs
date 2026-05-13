@@ -78,26 +78,24 @@ namespace TabControlWithLiveChart
             DataContext = this;
 
             // See docs/LiveCharts-TabSwitchFix.md for the full root-cause
-            // analysis. In one line: LiveCharts.Wpf.Components.ChartUpdater
-            // captures the base Chart's default AnimationsSpeed (300 ms)
-            // into a private `Freq` field that is never re-synced when
-            // DisableAnimations / AnimationsSpeed change. After every tab
-            // Unloaded → Run() recreates the Timer at that stale 300 ms,
-            // and pan/zoom rendering collapses to ~3 Hz. We rewrite the
-            // field directly via reflection so subsequent Timer
-            // recreations use the actual current frequency.
-            SyncUpdaterFreq();
+            // analysis. We hook every LiveCharts chart with the same
+            // workarounds — the LiveCharts defects are per-instance, so
+            // each CartesianChart needs its own:
+            //   * SyncUpdaterFreq: rewrite the private Freq field that
+            //     would otherwise resurrect a 300 ms Timer after each
+            //     tab Unloaded → Run() cycle.
+            //   * HookMouseCaptureForPan: install CaptureMouse on the
+            //     DrawMargin so MouseUp / drag-outside / focus-loss are
+            //     all handled (LiveCharts' Pan path doesn't capture).
+            //
+            // The methods are written to take a chart parameter so
+            // adding another chart anywhere in the app is a one-liner
+            // in this ctor.
+            ApplyLiveChartsTabSwitchFix(Chart);
+            ApplyLiveChartsTabSwitchFix(Chart2);
 
-            // LiveCharts' Pan path attaches MouseDown/Move/Up directly to
-            // the internal DrawMargin Canvas but never calls
-            // CaptureMouse(). If the user presses inside the chart,
-            // drags outside, and releases outside, DrawMargin never
-            // receives the MouseUp — IsPanning stays true and the next
-            // MouseMove after re-entering the chart resumes panning as
-            // if the button were still pressed. We capture/release the
-            // mouse around the existing Down/Up handlers so MouseUp
-            // always reaches DrawMargin even when the cursor is outside.
-            HookMouseCaptureForPan();
+            _chartVisibility[Chart] = true;     // first tab is selected by default
+            _chartVisibility[Chart2] = false;
         }
 
         private static readonly Type ChartBaseType =
@@ -114,20 +112,26 @@ namespace TabControlWithLiveChart
         private static readonly PropertyInfo ChartIsPanningProperty =
             ChartBaseType?.GetProperty("IsPanning", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        private void SyncUpdaterFreq()
+        private static void ApplyLiveChartsTabSwitchFix(LiveCharts.Wpf.CartesianChart chart)
         {
-            var updater = Chart.Model?.Updater;
+            SyncUpdaterFreq(chart);
+            HookMouseCaptureForPan(chart);
+        }
+
+        private static void SyncUpdaterFreq(LiveCharts.Wpf.CartesianChart chart)
+        {
+            var updater = chart.Model?.Updater;
             if (updater == null || UpdaterFreqProperty == null) return;
 
-            var freq = Chart.DisableAnimations
+            var freq = chart.DisableAnimations
                 ? TimeSpan.FromMilliseconds(10)
-                : Chart.AnimationsSpeed;
+                : chart.AnimationsSpeed;
             UpdaterFreqProperty.SetValue(updater, freq);
         }
 
-        private void HookMouseCaptureForPan()
+        private static void HookMouseCaptureForPan(LiveCharts.Wpf.CartesianChart chart)
         {
-            var drawMargin = ChartDrawMarginProperty?.GetValue(Chart) as UIElement;
+            var drawMargin = ChartDrawMarginProperty?.GetValue(chart) as UIElement;
             if (drawMargin == null) return;
 
             // PreviewMouseDown tunnels down, so this fires BEFORE
@@ -151,46 +155,57 @@ namespace TabControlWithLiveChart
             };
 
             // Backstop. Capture can be lost without DrawMargin ever
-            // receiving a MouseUp (capture stolen by another element,
-            // window deactivated, focus lost, alt-tab while dragging,
-            // etc.). In those paths OnDraggingEnd never fires and
-            // IsPanning stays latched true — so when the cursor later
-            // re-enters the chart the chart "follows" the cursor with
-            // the button no longer pressed.
-            //
-            // LostMouseCapture fires for every capture-loss route
-            // (including our own ReleaseMouseCapture above), so we
-            // unconditionally reset IsPanning here via reflection. In
-            // the normal release path it's a no-op because
-            // OnDraggingEnd has already set it to false.
+            // receiving a MouseUp (capture stolen, window deactivated,
+            // focus lost, alt-tab during drag). In those paths
+            // OnDraggingEnd never fires and IsPanning stays latched
+            // true — when the cursor later re-enters the chart it
+            // "follows" with no button pressed. LostMouseCapture fires
+            // for every capture-loss route (including our own
+            // ReleaseMouseCapture above), so we unconditionally reset
+            // IsPanning via reflection. In the normal release path
+            // OnDraggingEnd already cleared it, so the assignment is a
+            // no-op.
             drawMargin.LostMouseCapture += (s, e) =>
             {
-                ChartIsPanningProperty?.SetValue(Chart, false);
+                ChartIsPanningProperty?.SetValue(chart, false);
             };
         }
 
-        // Tracks whether the chart is currently in the visual tree. Set
-        // from IsVisibleChanged on the UI thread, read from the
-        // background producer to avoid two further LiveCharts defects:
-        //
-        //   * ChartValues.Add fires CollectionChanged on the calling
-        //     thread; calling it from the ThreadPool while Timer is null
-        //     makes Run() build a DispatcherTimer bound to the
-        //     ThreadPool thread's pump-less dispatcher (phantom timer →
-        //     IsUpdating latched true forever).
-        //
-        //   * UpdaterTick early-returns when invisible WITHOUT calling
-        //     Timer.Stop or IsUpdating=false, so any tick that fires
-        //     while the chart is off-screen also latches IsUpdating.
-        //
-        // Pausing the producer while invisible avoids both: no Run() is
-        // ever triggered on a background thread and no Tick ever fires
-        // off-screen.
-        private volatile bool _isChartVisible = true;
+        // Per-chart visibility tracked from each chart's
+        // IsVisibleChanged. The background producer pauses only when
+        // EVERY chart is off-screen; if any chart is on screen there is
+        // a consumer for the next Add. Stored as
+        // ConditionalWeakTable-ish IDictionary so adding charts later
+        // never needs a new field.
+        private readonly Dictionary<LiveCharts.Wpf.CartesianChart, bool> _chartVisibility
+            = new Dictionary<LiveCharts.Wpf.CartesianChart, bool>();
+
+        private bool IsAnyChartVisible
+        {
+            get
+            {
+                foreach (var kv in _chartVisibility)
+                    if (kv.Value) return true;
+                return false;
+            }
+        }
 
         private void OnChartIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
-            _isChartVisible = (bool)e.NewValue;
+            var chart = (LiveCharts.Wpf.CartesianChart)sender;
+            var visible = (bool)e.NewValue;
+            _chartVisibility[chart] = visible;
+
+            if (visible)
+            {
+                // Recover any latched IsUpdating: while this chart was
+                // off-screen, ChartValues.Add still triggered its
+                // Updater.Run() (because the values are shared with
+                // the other chart on the visible tab) and its
+                // UpdaterTick early-returned without clearing the
+                // flag. force=true bypasses the IsUpdating guard.
+                chart.Update(false, true);
+            }
         }
 
         private double _axisMax;
@@ -233,7 +248,7 @@ namespace TabControlWithLiveChart
                 Debug.WriteLine($"hi");
                 Thread.Sleep(150);
 
-                if (!_isChartVisible) continue;
+                if (!IsAnyChartVisible) continue;
 
                 var now = DateTime.Now;
                 _trend += r.Next(-8, 10);
@@ -243,7 +258,7 @@ namespace TabControlWithLiveChart
 
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    if (!_isChartVisible) return;
+                    if (!IsAnyChartVisible) return;
 
                     ChartValues.Add(new MeasureModel { DateTime = now, Value = trend });
                     ChartValues2.Add(new MeasureModel { DateTime = now, Value = trend2 });

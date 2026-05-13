@@ -51,7 +51,37 @@
                     </lvc:CartesianChart>
                 </Grid>
             </TabItem>
-            <TabItem Header="Test"></TabItem>
+            <TabItem Header="Test">
+                <lvc:CartesianChart x:Name="Chart2" AnimationsSpeed="0:0:0.15" DisableAnimations="True" Pan="X" IsVisibleChanged="OnChartIsVisibleChanged" Hoverable="False" DataTooltip="{x:Null}">
+                    <lvc:CartesianChart.Series>
+                        <lvc:LineSeries Values="{Binding ChartValues}"
+                                        PointGeometry="{x:Null}"
+                                        LineSmoothness="1"
+                                        StrokeThickness="4"
+                                        Stroke="#F34336"
+                                        Fill="Transparent"/>
+                        <lvc:LineSeries Values="{Binding ChartValues2}"
+                                        PointGeometry="{x:Null}"
+                                        LineSmoothness="1"
+                                        StrokeThickness="3"
+                                        Stroke="DarkGoldenrod"
+                                        Fill="Transparent"/>
+                    </lvc:CartesianChart.Series>
+                    <lvc:CartesianChart.AxisX>
+                        <lvc:Axis LabelFormatter="{Binding DateTimeFormatter}"
+                                  MaxValue="{Binding AxisMax}"
+                                  MinValue="{Binding AxisMin}"
+                                  Unit="{Binding AxisUnit}" Title="Time">
+                            <lvc:Axis.Separator>
+                                <lvc:Separator Step="{Binding AxisStep}" />
+                            </lvc:Axis.Separator>
+                        </lvc:Axis>
+                    </lvc:CartesianChart.AxisX>
+                    <lvc:CartesianChart.AxisY>
+                        <lvc:Axis Title="PWM"/>
+                    </lvc:CartesianChart.AxisY>
+                </lvc:CartesianChart>
+            </TabItem>
         </TabControl>
     </Grid>
 </Window>
