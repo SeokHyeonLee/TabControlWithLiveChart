@@ -162,11 +162,13 @@ namespace TabControlWithLiveChart
 
         private static double GetBotLimit(LiveCharts.AxisCore model)
         {
+            if (model == null || AxisCoreBotLimitProperty == null) return double.NaN;
             return (double)AxisCoreBotLimitProperty.GetValue(model);
         }
 
         private static double GetTopLimit(LiveCharts.AxisCore model)
         {
+            if (model == null || AxisCoreTopLimitProperty == null) return double.NaN;
             return (double)AxisCoreTopLimitProperty.GetValue(model);
         }
 
@@ -243,25 +245,68 @@ namespace TabControlWithLiveChart
             // clamped range via the MinValue/MaxValue setters, which
             // only fire UpdateChart (no PreviewRangeChanged), giving
             // us a one-shot clamp without recursion.
-            axis.PreviewRangeChanged += pe => ClampPan(pe, axis);
+            //
+            // We also refresh the shadows from inside this hook
+            // because when ClampPan cancels the pan, RangeChanged
+            // doesn't fire and the shadow state would otherwise stay
+            // stale.
+            Action update = () => UpdateShadow(chart, axis, leftShadow, rightShadow);
+            axis.PreviewRangeChanged += pe =>
+            {
+                ClampPan(pe, axis);
+                update();
+            };
 
             // Shadows need to be repositioned whenever the chart's
             // layout box changes, and re-evaluated for visibility
             // whenever the visible window slides over the data.
-            Action update = () => UpdateShadow(chart, axis, leftShadow, rightShadow);
             axis.RangeChanged += e => update();
             chart.SizeChanged += (s, e) => update();
+
+            // ContextIdle (3) is lower-priority than the Background (4)
+            // that LiveCharts' DispatcherTimer uses for its Tick, so
+            // this fires AFTER the first Tick has run and sized
+            // DrawMargin — without that ordering, the initial update
+            // would see drawMargin.ActualWidth == 0 and early-return,
+            // leaving the shadows hidden until the user resized or
+            // panned.
             chart.Loaded += (s, e) =>
-                chart.Dispatcher.BeginInvoke(update, DispatcherPriority.Loaded);
+                chart.Dispatcher.BeginInvoke(update, DispatcherPriority.ContextIdle);
+
+            // DrawMargin's actual size only becomes valid after
+            // LiveCharts' first layout pass, which can happen after
+            // chart.Loaded. Hooking the inner Canvas's own SizeChanged
+            // means we catch that 0 → real-size transition and
+            // re-place the shadows then.
+            var drawMargin = ChartDrawMarginProperty?.GetValue(chart) as FrameworkElement;
+            if (drawMargin != null)
+            {
+                drawMargin.SizeChanged += (s, e) => update();
+            }
         }
 
         private static void ClampPan(PreviewRangeChangedEventArgs pe, Axis axis)
         {
+            if (axis?.Model == null) return;
+
+            var dataMin = GetBotLimit(axis.Model);
+            var dataMax = GetTopLimit(axis.Model);
+
+            // Skip clamping until LiveCharts has actually computed a
+            // valid data range. Before the first Update tick the limits
+            // can be NaN, infinite, or both zero — clamping against
+            // those values would collapse the axis to [0, 0] on the
+            // very first pan and look like "scroll is dead".
+            if (double.IsNaN(dataMin) || double.IsNaN(dataMax)
+                || double.IsInfinity(dataMin) || double.IsInfinity(dataMax)
+                || dataMax <= dataMin)
+            {
+                return;
+            }
+
             var min = pe.PreviewMinValue;
             var max = pe.PreviewMaxValue;
             var width = max - min;
-            var dataMin = GetBotLimit(axis.Model);
-            var dataMax = GetTopLimit(axis.Model);
 
             var newMin = min;
             var newMax = max;
