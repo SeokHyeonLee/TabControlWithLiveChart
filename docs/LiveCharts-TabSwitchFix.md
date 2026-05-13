@@ -350,6 +350,32 @@ capture가 살아있는 동안에는 cursor가 차트 밖이든 위든 모든 mo
 DrawMargin으로 라우팅되므로 mouse release가 차트 바깥에서 일어나도
 `MouseUp` → `OnDraggingEnd` → `IsPanning = false`가 정상 수행된다.
 
+다만 capture가 **`MouseUp`을 거치지 않고** 풀려나가는 경로가 여럿 있다
+— 다른 element가 capture를 강탈, 윈도우 비활성화, 포커스 손실, 드래그 중
+alt-tab 등. 이 경우 `OnDraggingEnd`가 호출되지 않아 `IsPanning`이 `true`로
+latch된다. 사용자가 다시 차트 안으로 들어오면 `PanOnMouseMove`의
+`if (!IsPanning) return;` 가드를 그대로 통과해 버튼이 눌리지 않았는데도
+차트가 마우스를 따라옴.
+
+`LostMouseCapture` 이벤트는 capture가 풀리는 **모든** 경로에서 발사되므로
+여기서 reflection으로 `IsPanning`을 강제로 false로 리셋. 정상 release
+경로에서는 `OnDraggingEnd`가 이미 false로 만들었으므로 no-op:
+
+```csharp
+drawMargin.MouseUp += (s, e) => ((UIElement)s).ReleaseMouseCapture();
+
+drawMargin.LostMouseCapture += (s, e) =>
+{
+    ChartIsPanningProperty?.SetValue(Chart, false);
+};
+```
+
+또한 capture release는 **bubble `MouseUp`** 에서 수행한다. 이 시점은
+LiveCharts의 `OnDraggingEnd`가 이미 `IsPanning=false`를 수행한 뒤이므로
+타이밍 이슈가 없다 (LiveCharts가 chart ctor에서 먼저 구독, 우리는
+`MainWindow` ctor에서 나중에 구독 → bubble 단계에서 `OnDraggingEnd`가 먼저
+발사).
+
 ---
 
 ## 5. 검증
@@ -362,6 +388,7 @@ DrawMargin으로 라우팅되므로 mouse release가 차트 바깥에서 일어�
 | 탭 전환 후 Pan | **~3 Hz 끊김** | OK (~100 Hz) |
 | 탭 N번 왕복 후 모든 동작 | 누적 악화 | 매 회 동일 |
 | 누른 채 차트 밖에서 release → 재진입 | **차트가 마우스를 따라옴** | OK (capture로 외부 release 정상 처리) |
+| 드래그 중 capture 강탈/포커스 손실/alt-tab 후 재진입 | **차트가 마우스를 따라옴** | OK (LostMouseCapture backstop) |
 
 ---
 

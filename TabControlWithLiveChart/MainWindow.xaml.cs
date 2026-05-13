@@ -100,15 +100,19 @@ namespace TabControlWithLiveChart
             HookMouseCaptureForPan();
         }
 
+        private static readonly Type ChartBaseType =
+            typeof(LiveCharts.Wpf.CartesianChart).BaseType;
+
         private static readonly PropertyInfo UpdaterFreqProperty =
             typeof(LiveCharts.Wpf.CartesianChart).Assembly
                 .GetType("LiveCharts.Wpf.Components.ChartUpdater")
                 ?.GetProperty("Freq", BindingFlags.NonPublic | BindingFlags.Instance);
 
         private static readonly PropertyInfo ChartDrawMarginProperty =
-            typeof(LiveCharts.Wpf.CartesianChart).Assembly
-                .GetType("LiveCharts.Wpf.Charts.Base.Chart")
-                ?.GetProperty("DrawMargin", BindingFlags.NonPublic | BindingFlags.Instance);
+            ChartBaseType?.GetProperty("DrawMargin", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private static readonly PropertyInfo ChartIsPanningProperty =
+            ChartBaseType?.GetProperty("IsPanning", BindingFlags.NonPublic | BindingFlags.Instance);
 
         private void SyncUpdaterFreq()
         {
@@ -128,15 +132,40 @@ namespace TabControlWithLiveChart
 
             // PreviewMouseDown tunnels down, so this fires BEFORE
             // LiveCharts' MouseDown bubble handler (OnDraggingStart) —
-            // the capture is in place by the time IsPanning is flipped
-            // to true.
+            // the capture is in place by the time IsPanning flips to
+            // true. With capture, MouseMove keeps routing to DrawMargin
+            // even when the cursor leaves the chart's bounds, so pan
+            // visibly continues outside the chart.
             drawMargin.PreviewMouseDown += (s, e) =>
             {
                 ((UIElement)s).CaptureMouse();
             };
-            drawMargin.PreviewMouseUp += (s, e) =>
+
+            // Release on the bubble MouseUp (AFTER OnDraggingEnd has
+            // already run and set IsPanning=false). LiveCharts
+            // subscribed first in the chart ctor, we subscribe later
+            // here, so OnDraggingEnd runs first.
+            drawMargin.MouseUp += (s, e) =>
             {
                 ((UIElement)s).ReleaseMouseCapture();
+            };
+
+            // Backstop. Capture can be lost without DrawMargin ever
+            // receiving a MouseUp (capture stolen by another element,
+            // window deactivated, focus lost, alt-tab while dragging,
+            // etc.). In those paths OnDraggingEnd never fires and
+            // IsPanning stays latched true — so when the cursor later
+            // re-enters the chart the chart "follows" the cursor with
+            // the button no longer pressed.
+            //
+            // LostMouseCapture fires for every capture-loss route
+            // (including our own ReleaseMouseCapture above), so we
+            // unconditionally reset IsPanning here via reflection. In
+            // the normal release path it's a no-op because
+            // OnDraggingEnd has already set it to false.
+            drawMargin.LostMouseCapture += (s, e) =>
+            {
+                ChartIsPanningProperty?.SetValue(Chart, false);
             };
         }
 
