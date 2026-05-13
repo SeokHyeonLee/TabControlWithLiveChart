@@ -87,12 +87,28 @@ namespace TabControlWithLiveChart
             // field directly via reflection so subsequent Timer
             // recreations use the actual current frequency.
             SyncUpdaterFreq();
+
+            // LiveCharts' Pan path attaches MouseDown/Move/Up directly to
+            // the internal DrawMargin Canvas but never calls
+            // CaptureMouse(). If the user presses inside the chart,
+            // drags outside, and releases outside, DrawMargin never
+            // receives the MouseUp — IsPanning stays true and the next
+            // MouseMove after re-entering the chart resumes panning as
+            // if the button were still pressed. We capture/release the
+            // mouse around the existing Down/Up handlers so MouseUp
+            // always reaches DrawMargin even when the cursor is outside.
+            HookMouseCaptureForPan();
         }
 
         private static readonly PropertyInfo UpdaterFreqProperty =
             typeof(LiveCharts.Wpf.CartesianChart).Assembly
                 .GetType("LiveCharts.Wpf.Components.ChartUpdater")
                 ?.GetProperty("Freq", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        private static readonly PropertyInfo ChartDrawMarginProperty =
+            typeof(LiveCharts.Wpf.CartesianChart).Assembly
+                .GetType("LiveCharts.Wpf.Charts.Base.Chart")
+                ?.GetProperty("DrawMargin", BindingFlags.NonPublic | BindingFlags.Instance);
 
         private void SyncUpdaterFreq()
         {
@@ -103,6 +119,25 @@ namespace TabControlWithLiveChart
                 ? TimeSpan.FromMilliseconds(10)
                 : Chart.AnimationsSpeed;
             UpdaterFreqProperty.SetValue(updater, freq);
+        }
+
+        private void HookMouseCaptureForPan()
+        {
+            var drawMargin = ChartDrawMarginProperty?.GetValue(Chart) as UIElement;
+            if (drawMargin == null) return;
+
+            // PreviewMouseDown tunnels down, so this fires BEFORE
+            // LiveCharts' MouseDown bubble handler (OnDraggingStart) —
+            // the capture is in place by the time IsPanning is flipped
+            // to true.
+            drawMargin.PreviewMouseDown += (s, e) =>
+            {
+                ((UIElement)s).CaptureMouse();
+            };
+            drawMargin.PreviewMouseUp += (s, e) =>
+            {
+                ((UIElement)s).ReleaseMouseCapture();
+            };
         }
 
         // Tracks whether the chart is currently in the visual tree. Set

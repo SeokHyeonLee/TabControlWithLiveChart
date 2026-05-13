@@ -174,6 +174,32 @@ invisible-tick IsUpdating latch — 도 이 stuck Timer 위에서 증상으로 �
 **메시지 펌프 없는 임시 Dispatcher**다. Tick이 영원히 발사되지 않으니
 `IsUpdating = true` 영구 stuck → 차트 사망.
 
+### 3-C. Pan에 mouse capture가 없다
+
+`WpfView/Charts/Base/Chart.cs`는 Pan 처리를 위해 `DrawMargin`에
+`MouseDown`/`MouseUp`/`MouseMove`를 직접 붙이는데 **`CaptureMouse()`를
+호출하지 않는다**:
+
+```csharp
+DrawMargin.MouseDown += OnDraggingStart;   // IsPanning = true
+DrawMargin.MouseUp   += OnDraggingEnd;     // IsPanning = false
+DrawMargin.MouseMove += PanOnMouseMove;    // if (IsPanning) drag
+// CaptureMouse() 호출 없음
+```
+
+같은 파일의 ScrollBar 핸들러는 `CaptureMouse`/`ReleaseMouseCapture`를
+명시적으로 호출하지만 Pan 경로는 안 한다.
+
+WPF에서 mouse capture가 없으면 `MouseUp`은 cursor가 element 위에 있어야만
+발사된다. 따라서 다음 시나리오가 깨진다:
+
+1. 차트 위에서 mouse down → `IsPanning = true`
+2. 누른 채로 cursor가 차트 밖으로 이동
+3. 차트 밖에서 mouse release → **`DrawMargin.MouseUp`이 발사 안 됨** →
+   `IsPanning` 영구 `true`
+4. cursor가 다시 차트 안으로 들어옴 → `MouseMove` 발사 → `IsPanning=true`
+   조건 통과 → 사용자가 버튼을 누르지 않았는데도 차트가 마우스를 따라옴
+
 ### 3-B. Invisible Tick이 IsUpdating을 latch한다
 
 `WpfView/Components/ChartUpdater.cs`의 `UpdaterTick`:
@@ -203,7 +229,7 @@ invisible 상태에서 Tick이 한 번이라도 발사되면 `IsUpdating`이 `tr
 
 ## 4. 수정
 
-세 가지 변경. 외부 라이브러리 없음, MVVM 그대로, View 동적 생성 없음.
+네 가지 변경. 외부 라이브러리 없음, MVVM 그대로, View 동적 생성 없음.
 
 ### 4-1. 핵심: `Freq` 리플렉션 동기화
 
@@ -297,6 +323,33 @@ private void OnChartIsVisibleChanged(object sender, DependencyPropertyChangedEve
 TabControl 외 다른 호스팅(Frame/ContentControl/Visibility 토글 등)까지 커버하므로
 더 일반적이다.
 
+### 4-4. Pan에 mouse capture를 직접 걸어준다 (§3-C 회피)
+
+내부 `DrawMargin`을 리플렉션으로 꺼내 `PreviewMouseDown`/`PreviewMouseUp`을
+hook. `PreviewMouseDown`은 tunneling이므로 LiveCharts의 bubble 핸들러
+`OnDraggingStart`보다 먼저 발사되어, `IsPanning`이 `true`로 바뀌는 시점엔
+이미 capture가 잡혀있다.
+
+```csharp
+private static readonly PropertyInfo ChartDrawMarginProperty =
+    typeof(LiveCharts.Wpf.CartesianChart).Assembly
+        .GetType("LiveCharts.Wpf.Charts.Base.Chart")
+        ?.GetProperty("DrawMargin", BindingFlags.NonPublic | BindingFlags.Instance);
+
+private void HookMouseCaptureForPan()
+{
+    var drawMargin = ChartDrawMarginProperty?.GetValue(Chart) as UIElement;
+    if (drawMargin == null) return;
+
+    drawMargin.PreviewMouseDown += (s, e) => ((UIElement)s).CaptureMouse();
+    drawMargin.PreviewMouseUp   += (s, e) => ((UIElement)s).ReleaseMouseCapture();
+}
+```
+
+capture가 살아있는 동안에는 cursor가 차트 밖이든 위든 모든 mouse 이벤트가
+DrawMargin으로 라우팅되므로 mouse release가 차트 바깥에서 일어나도
+`MouseUp` → `OnDraggingEnd` → `IsPanning = false`가 정상 수행된다.
+
 ---
 
 ## 5. 검증
@@ -308,6 +361,7 @@ TabControl 외 다른 호스팅(Frame/ContentControl/Visibility 토글 등)까�
 | 탭 전환 후 데이터 피드 | 멈춤 또는 ~3 Hz | OK (원래 6.67 Hz) |
 | 탭 전환 후 Pan | **~3 Hz 끊김** | OK (~100 Hz) |
 | 탭 N번 왕복 후 모든 동작 | 누적 악화 | 매 회 동일 |
+| 누른 채 차트 밖에서 release → 재진입 | **차트가 마우스를 따라옴** | OK (capture로 외부 release 정상 처리) |
 
 ---
 
